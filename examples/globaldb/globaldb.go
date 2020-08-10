@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -15,28 +16,31 @@ import (
 	"syscall"
 	"time"
 
+	ipfslite "github.com/hsanjuan/ipfs-lite"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
 	crdt "github.com/ipfs/go-ds-crdt"
 	logging "github.com/ipfs/go-log/v2"
-
 	crypto "github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-
-	ipfslite "github.com/hsanjuan/ipfs-lite"
 	"github.com/mitchellh/go-homedir"
-
 	multiaddr "github.com/multiformats/go-multiaddr"
 )
 
 var (
-	logger    = logging.Logger("globaldb")
-	listen, _ = multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/33123")
-	topicName = "globaldb-example"
-	netTopic  = "globaldb-example-net"
-	config    = "globaldb-example"
+	logger            = logging.Logger("globaldb")
+	defaultListenAddr = "/ip4/0.0.0.0/tcp/33123"
+	topicName         = "globaldb-example"
+	netTopic          = "globaldb-example-net"
+	config            = "globaldb-example"
+
+	homeDir       string
+	listenAddr    string
+	logLevel      string
+	bootstrap     bool
+	bootstrapPeer string
 )
 
 func main() {
@@ -44,36 +48,51 @@ func main() {
 	// https://github.com/ipfs/infra/issues/378
 	crypto.MinRsaKeyBits = 1024
 
-	logging.SetLogLevel("*", "error")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	dir, err := homedir.Dir()
 	if err != nil {
 		logger.Fatal(err)
 	}
-	data := filepath.Join(dir, config)
 
-	store, err := ipfslite.BadgerDatastore(data)
+	flag.StringVar(&homeDir, "dir", filepath.Join(dir, config), "The server data directory")
+	flag.StringVar(&listenAddr, "listen-addr", defaultListenAddr, "The server listening address")
+	flag.StringVar(&logLevel, "log-level", "error", "The server log level")
+	flag.BoolVar(&bootstrap, "bootstrap", false, "Enable server bootstrapping")
+	flag.StringVar(&bootstrapPeer, "bootstrap-peer", "", "The multiaddress of a bootstrapping peer")
+	flag.Parse()
+
+	if err := logging.SetLogLevel("*", logLevel); err != nil {
+		logger.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	listen, err := multiaddr.NewMultiaddr(listenAddr)
+	if err != nil {
+		logger.Fatal(err)
+	}
+
+	store, err := ipfslite.BadgerDatastore(homeDir)
 	if err != nil {
 		logger.Fatal(err)
 	}
 	defer store.Close()
 
-	keyPath := filepath.Join(data, "key")
+	keyPath := filepath.Join(homeDir, "key")
 	var priv crypto.PrivKey
-	_, err = os.Stat(keyPath)
-	if os.IsNotExist(err) {
+
+	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
 		priv, _, err = crypto.GenerateKeyPair(crypto.Ed25519, 1)
 		if err != nil {
 			logger.Fatal(err)
 		}
+
 		data, err := crypto.MarshalPrivateKey(priv)
 		if err != nil {
 			logger.Fatal(err)
 		}
-		err = ioutil.WriteFile(keyPath, data, 0400)
-		if err != nil {
+
+		if err = ioutil.WriteFile(keyPath, data, 0400); err != nil {
 			logger.Fatal(err)
 		}
 	} else if err != nil {
@@ -83,16 +102,20 @@ func main() {
 		if err != nil {
 			logger.Fatal(err)
 		}
+
 		priv, err = crypto.UnmarshalPrivateKey(key)
 		if err != nil {
 			logger.Fatal(err)
 		}
 
 	}
+
 	pid, err := peer.IDFromPublicKey(priv.GetPublic())
 	if err != nil {
 		logger.Fatal(err)
 	}
+
+	logger.Errorf("pid: %s", pid.String())
 
 	h, dht, err := ipfslite.SetupLibp2p(
 		ctx,
@@ -105,6 +128,7 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
+
 	defer h.Close()
 	defer dht.Close()
 
@@ -123,8 +147,7 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	// Use a special pubsub topic to avoid disconnecting
-	// from globaldb peers.
+	// Use a special pubsub topic to avoid disconnecting from globaldb peers.
 	go func() {
 		for {
 			msg, err := netSubs.Next(ctx)
@@ -175,13 +198,20 @@ func main() {
 	}
 	defer crdt.Close()
 
-	fmt.Println("Bootstrapping...")
+	if bootstrap {
+		logger.Error("Bootstrapping...")
 
-	bstr, _ := multiaddr.NewMultiaddr("/ip4/94.130.135.167/tcp/33123/ipfs/12D3KooWFta2AE7oiK1ioqjVAKajUJauZWfeM7R413K7ARtHRDAu")
-	inf, _ := peer.AddrInfoFromP2pAddr(bstr)
-	list := append(ipfslite.DefaultBootstrapPeers(), *inf)
-	ipfs.Bootstrap(list)
-	h.ConnManager().TagPeer(inf.ID, "keep", 100)
+		// bstr, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/33123/ipfs/12D3KooWFta2AE7oiK1ioqjVAKajUJauZWfeM7R413K7ARtHRDAu")
+		bootstrapPeerAddr, err := multiaddr.NewMultiaddr(bootstrapPeer)
+		if err != nil {
+			logger.Fatal(err)
+		}
+
+		inf, _ := peer.AddrInfoFromP2pAddr(bootstrapPeerAddr)
+		// list := append(ipfslite.DefaultBootstrapPeers(), *inf)
+		ipfs.Bootstrap([]peer.AddrInfo{*inf})
+		h.ConnManager().TagPeer(inf.ID, "keep", 100)
+	}
 
 	fmt.Printf(`
 Peer ID: %s
@@ -200,7 +230,7 @@ Commands:
 
 
 `,
-		pid, listen, topicName, data,
+		pid, listen, topicName, homeDir,
 	)
 
 	if len(os.Args) > 1 && os.Args[1] == "daemon" {
